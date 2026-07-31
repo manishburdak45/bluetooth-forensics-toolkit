@@ -218,6 +218,21 @@ class BluetoothScanner:
     async def scan_ble(self, timeout: int | None = None) -> list[dict[str, Any]]:
         """Discover nearby BLE devices using :mod:`bleak`.
 
+        Implementation note: this method deliberately avoids the
+        ``BleakScanner.discover(..., return_adv=True)`` convenience
+        classmethod. On some BlueZ/D-Bus configurations that call has been
+        observed to hang indefinitely (e.g. if the adapter is already in a
+        discovering state, or a D-Bus signal is dropped), because its
+        internal ``start()``/``stop()`` calls are not bounded by any
+        timeout of their own. Instead, a :class:`BleakScanner` instance is
+        driven manually as an async context manager for exactly
+        ``scan_timeout`` seconds, and that whole operation is wrapped in
+        :func:`asyncio.wait_for` with a hard ceiling so a stuck ``start()``
+        or ``stop()`` call can never block the rest of the program.
+        Discovered devices (with advertisement data) are then read from the
+        scanner's ``discovered_devices_and_advertisement_data`` property,
+        which is the modern, non-deprecated equivalent of ``return_adv``.
+
         Args:
             timeout: Scan duration in seconds. Defaults to the scanner's
                 configured BLE timeout.
@@ -230,35 +245,60 @@ class BluetoothScanner:
             never raised.
         """
         scan_timeout = timeout if timeout is not None else self._ble_timeout
+        # Hard ceiling on top of the requested scan duration itself, so
+        # that a start()/stop() call stuck on D-Bus cannot hang forever.
+        hard_timeout = scan_timeout + 10
+
         devices: list[dict[str, Any]] = []
+        scanner = BleakScanner()
+
+        async def _run_scan() -> None:
+            async with scanner:
+                await asyncio.sleep(scan_timeout)
 
         try:
-            discovered = await BleakScanner.discover(
-              timeout=10
+            await asyncio.wait_for(_run_scan(), timeout=hard_timeout)
+        except asyncio.TimeoutError:
+            self._logger.error(
+                "BLE scan did not finish within %d second(s); returning "
+                "whatever devices were discovered so far.",
+                hard_timeout,
             )
-        
+            # Best-effort cleanup: try to stop the scanner so the adapter
+            # isn't left in a stuck discovering state. Bounded by its own
+            # short timeout so this can never itself hang the program.
+            try:
+                await asyncio.wait_for(scanner.stop(), timeout=5)
+            except Exception:  # noqa: BLE001 - cleanup must never raise
+                pass
         except BleakError as exc:
             self._logger.error("BLE scan failed: %s", exc)
             return []
         except PermissionError:
             self._logger.error("Permission denied while performing BLE scan.")
             return []
-        except asyncio.TimeoutError:
-            self._logger.error("BLE scan timed out.")
-            return []
         except OSError as exc:
             self._logger.error("BLE scan failed due to a system error: %s", exc)
             return []
+        except Exception as exc:  # noqa: BLE001 - never let BLE scanning crash the app
+            self._logger.error("Unexpected error during BLE scan: %s", exc)
+            return []
 
-        for device in discovered:
-        devices.append(
-         {
-            "name": device.name or "Unknown",
-            "mac": device.address,
-            "rssi": getattr(device, "rssi", None),
-            "type": "BLE",
-         }
-        )
+        discovered = scanner.discovered_devices_and_advertisement_data
+
+        for address, discovery in discovered.items():
+            device, advertisement = discovery
+            name = device.name or _UNKNOWN_DEVICE_NAME
+            mac = normalize_mac_address(address) or address
+            rssi = getattr(advertisement, "rssi", None)
+            devices.append(
+                {
+                    "name": name,
+                    "mac": mac,
+                    "rssi": rssi,
+                    "type": "BLE",
+                }
+            )
 
         self._logger.info("BLE scan discovered %d device(s).", len(devices))
         return devices
