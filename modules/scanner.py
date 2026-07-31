@@ -234,8 +234,9 @@ class BluetoothScanner:
 
         try:
             discovered = await BleakScanner.discover(
-                timeout=scan_timeout, return_adv=True
+              timeout=10
             )
+        
         except BleakError as exc:
             self._logger.error("BLE scan failed: %s", exc)
             return []
@@ -249,19 +250,15 @@ class BluetoothScanner:
             self._logger.error("BLE scan failed due to a system error: %s", exc)
             return []
 
-        for address, discovery in discovered.items():
-            device, advertisement = discovery
-            name = device.name or _UNKNOWN_DEVICE_NAME
-            mac = normalize_mac_address(address) or address
-            rssi = getattr(advertisement, "rssi", None)
-            devices.append(
-                {
-                    "name": name,
-                    "mac": mac,
-                    "rssi": rssi,
-                    "type": "BLE",
-                }
-            )
+        for device in discovered:
+        devices.append(
+         {
+            "name": device.name or "Unknown",
+            "mac": device.address,
+            "rssi": getattr(device, "rssi", None),
+            "type": "BLE",
+         }
+        )
 
         self._logger.info("BLE scan discovered %d device(s).", len(devices))
         return devices
