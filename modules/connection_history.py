@@ -21,6 +21,54 @@ deduplicates, and orders that evidence into a structured connection
 history. It never prints output; presentation is the responsibility of
 ``app.py`` / ``modules/report.py``.
 
+Recognized event types
+------------------------
+This module classifies evidence into the following event types (see
+:data:`EVENT_TYPES`), and never upgrades a weaker one into a stronger
+claim:
+
+* ``connected`` / ``disconnected`` -- an explicit ``Connected: yes``/
+  ``Connected: no`` property transition. The single most direct evidence
+  of an actual connection state change.
+* ``connection_attempt`` -- explicit daemon wording indicating an
+  attempt to connect, with no established success or failure.
+* ``connection_failed`` -- an explicit daemon failure message (e.g.
+  ``"failed connect to <MAC>: Connection refused (111)"``). Evidence of
+  a failed attempt, never treated as evidence of any successful
+  connection, past or present.
+* ``authentication_failure`` -- an explicit BlueZ authentication-failure
+  reason (e.g. a ``BREDR.Disconnected - org.bluez.Reason.Authentication``
+  signal). Evidence that a session was rejected/terminated, never
+  evidence that a session was ever successfully established.
+* ``paired`` / ``trusted`` / ``blocked`` -- explicit BlueZ static
+  relationship state, from either a live property line or a persisted
+  BlueZ artifact record. Never converted into ``connected``.
+* ``discovered`` -- a scan/monitor discovery marker. The weakest
+  evidence type; never converted into ``connected``.
+* ``advertised`` -- an observed RSSI/signal property update.
+* ``unknown`` -- evidence that does not map to any of the above.
+
+Free-form daemon messages describing a connection failure, connection
+attempt, or authentication failure do not follow the structured
+``Device <MAC> <Field>: <value>`` shape that ``connected``/``paired``/
+``trusted``/``blocked`` events do, so they are recognized by narrow,
+explicit keyword matching instead (see :meth:`_classify_freeform_line`).
+A MAC address must be present in the *same* line -- in either standard
+colon-delimited form or as a BlueZ D-Bus device-path segment (e.g.
+``"dev_84_9D_4B_00_A9_58"``, which encodes the identical MAC address
+using underscores) -- for such an event to be created at all; a
+failure/attempt/authentication message with no attributable MAC in the
+line is intentionally left unclassified rather than guessed at.
+
+This module performs **no** subprocess execution, **no** live Bluetooth
+scanning, and **no** file I/O of its own. It is a pure evidence
+*interpretation* layer: callers gather raw evidence (log text, BlueZ
+artifact records, or already-structured events from other forensic
+modules) and hand it to this module, which parses, classifies,
+deduplicates, and orders that evidence into a structured connection
+history. It never prints output; presentation is the responsibility of
+``app.py`` / ``modules/report.py``.
+
 BlueTrace Forensic Suite is a defensive, forensic-oriented tool intended
 for lawful digital forensics and incident-response use cases involving
 Bluetooth Classic and Bluetooth Low Energy (BLE) devices on Linux.
@@ -42,10 +90,15 @@ Forensic limitations
 * The absence of a historical record for a MAC address does NOT prove
   that device was never connected -- only that no supporting evidence
   was found among the sources supplied to this module.
+* A connection attempt does not prove a successful connection. A
+  connection failure does not prove any prior successful connection. An
+  authentication failure does not prove a successful session was ever
+  established. These are each recorded as their own distinct event
+  type and never conflated with ``connected``.
 * This module reconstructs history exclusively from the evidence it is
   given. It never fabricates timestamps, device names, or connection
   events, and it never upgrades weaker evidence (discovery, pairing,
-  trust) into a "connected" event.
+  trust, a failed or attempted connection) into a "connected" event.
 """
 
 from __future__ import annotations
@@ -68,13 +121,18 @@ _UNKNOWN_VALUE: Final[str] = "Unknown"
 
 #: The set of event types this module will ever assign to a reconstructed
 #: history entry. Kept deliberately distinct so that discovery/pairing/
-#: trust evidence is never conflated with an actual connection event.
+#: trust/attempt/failure evidence is never conflated with an actual
+#: established connection event.
 EVENT_TYPES: Final[frozenset[str]] = frozenset(
     {
         "connected",
         "disconnected",
+        "connection_attempt",
+        "connection_failed",
+        "authentication_failure",
         "paired",
         "trusted",
+        "blocked",
         "discovered",
         "advertised",
         "unknown",
@@ -142,7 +200,40 @@ _NEW_DEVICE_PATTERN: Final[re.Pattern[str]] = re.compile(
 _CONNECTED_FIELD_NAMES: Final[frozenset[str]] = frozenset({"Connected"})
 _PAIRED_FIELD_NAMES: Final[frozenset[str]] = frozenset({"Paired"})
 _TRUSTED_FIELD_NAMES: Final[frozenset[str]] = frozenset({"Trusted"})
+_BLOCKED_FIELD_NAMES: Final[frozenset[str]] = frozenset({"Blocked"})
 _NAME_FIELD_NAMES: Final[frozenset[str]] = frozenset({"Name", "Alias"})
+
+#: Matches a MAC address encoded as a BlueZ D-Bus device-object-path
+#: segment, e.g. ``"dev_84_9D_4B_00_A9_58"`` (as seen in lines such as
+#: ``".../hci0/dev_84_9D_4B_00_A9_58: BREDR.Disconnected - ..."``).
+#: BlueZ substitutes underscores for colons within D-Bus object paths;
+#: this still refers to the exact same MAC address already present in
+#: the evidence -- reading it in this alternate encoding is not
+#: inference or fabrication.
+_DBUS_DEVICE_PATH_MAC_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"dev_(?P<mac>[0-9A-Fa-f]{2}(?:_[0-9A-Fa-f]{2}){5})\b"
+)
+
+#: Narrow, explicit keyword patterns recognizing free-form (non
+#: ``Device <MAC> <Field>: <value>``) ``bluetoothd``/``journalctl``
+#: messages that describe an authentication failure, a connection
+#: failure, or a connection attempt. Drawn directly from real evidence
+#: observed during testing and deliberately kept specific, to avoid
+#: false positives from unrelated Bluetooth log text.
+_AUTH_FAILURE_KEYWORDS_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"authentication\s+failure|reason\.authentication", re.IGNORECASE
+)
+_CONNECTION_FAILED_KEYWORDS_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"failed\s+connect\s+to|connect\s+failed|failed\s+to\s+connect",
+    re.IGNORECASE,
+)
+_CONNECTION_REFUSED_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"connection\s+refused", re.IGNORECASE
+)
+_CONNECTION_ATTEMPT_KEYWORDS_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\bconnecting\s+to\b|\battempting\s+to\s+connect\b|\bconnect\s+attempt\b",
+    re.IGNORECASE,
+)
 
 
 class ConnectionHistoryAnalyzer:
@@ -306,10 +397,13 @@ class ConnectionHistoryAnalyzer:
                 derived from, preserved verbatim for provenance.
 
         Returns:
-            A structured event dictionary. Internal-only key
-            ``"_sort_datetime"`` is included to support deterministic
-            ordering and is stripped before results are returned to
-            callers.
+            A structured event dictionary. ``"corroboration_count"`` and
+            ``"corroborating_sources"`` are initialized for a single
+            source here and may be recomputed across the full,
+            deduplicated event set by :meth:`_annotate_corroboration`.
+            Internal-only key ``"_sort_datetime"`` is included to
+            support deterministic ordering and is stripped before
+            results are returned to callers.
         """
         safe_confidence = confidence if confidence in CONFIDENCE_LEVELS else "UNKNOWN"
         safe_event_type = event_type if event_type in EVENT_TYPES else "unknown"
@@ -338,8 +432,84 @@ class ConnectionHistoryAnalyzer:
             "confidence": safe_confidence,
             "raw_reference": raw_reference,
             "corroboration_count": 1,
+            "corroborating_sources": [f"{source_type}:{source_reference}"],
             "_sort_datetime": parsed_timestamp,
         }
+
+    # ----------------------------------------------------------------- #
+    # Free-form daemon message classification
+    # ----------------------------------------------------------------- #
+
+    @staticmethod
+    def _extract_any_mac(text: str) -> str | None:
+        """Search free-form log text for a MAC address in any recognized form.
+
+        Recognizes both a standard colon-delimited MAC address and a
+        BlueZ D-Bus device-object-path MAC segment (underscore-
+        delimited, as in ``".../dev_84_9D_4B_00_A9_58"``). Both forms
+        encode the exact same MAC address already present in the
+        evidence text; neither is inferred, guessed, or fabricated.
+
+        Args:
+            text: The raw line (or timestamp-stripped line remainder)
+                to search.
+
+        Returns:
+            The normalized MAC address (colon-delimited, uppercase) if
+            one is found in either recognized form, or ``None`` if no
+            MAC address is present in ``text`` at all -- in which case
+            the caller must not attach any MAC to whatever event the
+            line might otherwise describe.
+        """
+        direct_match = _MAC_SEARCH_PATTERN.search(text)
+        if direct_match:
+            return normalize_mac_address(direct_match.group(1))
+
+        dbus_match = _DBUS_DEVICE_PATH_MAC_PATTERN.search(text)
+        if dbus_match:
+            colon_form = dbus_match.group("mac").replace("_", ":")
+            return normalize_mac_address(colon_form)
+
+        return None
+
+    @staticmethod
+    def _classify_freeform_line(text: str) -> tuple[str, str] | None:
+        """Classify a free-form (non ``Device <MAC> <Field>: <value>``) log line.
+
+        Recognizes explicit, narrowly-scoped phrasing for connection
+        failures, authentication failures, and connection attempts,
+        drawn directly from real ``bluetoothd``/``journalctl`` output
+        observed during testing (e.g. ``"failed connect to <MAC>:
+        Connection refused (111)"`` or a
+        ``BREDR.Disconnected - org.bluez.Reason.Authentication`` line).
+        A line that does not match one of these specific patterns is
+        left unclassified -- and therefore skipped by the caller --
+        rather than guessed at. Checked in order of evidentiary
+        specificity: an explicit authentication-failure reason is the
+        most diagnostic, followed by an explicit connection failure,
+        followed by mere attempt language.
+
+        Args:
+            text: The line text to classify (already stripped of any
+                leading timestamp prefix).
+
+        Returns:
+            A tuple of ``(event_type, confidence)`` if the line's
+            wording clearly supports one of the recognized event types,
+            or ``None`` if it does not match any of them.
+        """
+        if _AUTH_FAILURE_KEYWORDS_PATTERN.search(text):
+            return "authentication_failure", "HIGH"
+
+        if _CONNECTION_FAILED_KEYWORDS_PATTERN.search(text) or (
+            _CONNECTION_REFUSED_PATTERN.search(text)
+        ):
+            return "connection_failed", "HIGH"
+
+        if _CONNECTION_ATTEMPT_KEYWORDS_PATTERN.search(text):
+            return "connection_attempt", "MEDIUM"
+
+        return None
 
     # ----------------------------------------------------------------- #
     # Evidence source: raw log text (bluetoothd / journalctl style)
@@ -370,13 +540,36 @@ class ConnectionHistoryAnalyzer:
         * ``Paired: yes`` -> ``paired`` (MEDIUM confidence -- strong
           corroborating artifact, but not itself a connection event).
         * ``Trusted: yes`` -> ``trusted`` (MEDIUM confidence).
+        * ``Blocked: yes`` -> ``blocked`` (MEDIUM confidence).
         * ``[NEW] Device <mac> ...`` -> ``discovered`` (LOW confidence --
           weak/ambiguous; a discovered device may never have connected).
 
-        ``Connected: no``, ``Paired: no``, and ``Trusted: no`` for
-        paired/trusted are not emitted as separate negative events beyond
-        the explicit ``disconnected`` case, since a bare "no" on its own
-        is not reliable evidence of a specific historical transition.
+        In addition, free-form daemon messages that do not follow the
+        ``Device <MAC> <Field>: <value>`` shape are recognized by
+        narrow keyword matching (see :meth:`_classify_freeform_line`),
+        provided a MAC address is present in the same line (standard
+        colon form or a BlueZ D-Bus device-path segment; see
+        :meth:`_extract_any_mac`):
+
+        * An explicit authentication-failure reason (e.g.
+          ``"BREDR.Disconnected - org.bluez.Reason.Authentication"``)
+          -> ``authentication_failure`` (HIGH confidence).
+        * An explicit connection-failure message (e.g. ``"failed
+          connect to <MAC>: Connection refused (111)"``) ->
+          ``connection_failed`` (HIGH confidence).
+        * Explicit attempt language with no established outcome ->
+          ``connection_attempt`` (MEDIUM confidence).
+
+        None of these is ever upgraded into ``connected``: a failed or
+        attempted connection, or an authentication failure, is recorded
+        exactly as such and never treated as evidence that a connection
+        was ever successfully established.
+
+        ``Connected: no``, ``Paired: no``, ``Trusted: no``, and
+        ``Blocked: no`` are not emitted as separate negative events
+        beyond the explicit ``disconnected`` case, since a bare "no" on
+        its own is not reliable evidence of a specific historical
+        transition.
 
         Args:
             content: The raw text content of the log evidence (may span
@@ -448,37 +641,68 @@ class ConnectionHistoryAnalyzer:
                 continue
 
             field_match = _DEVICE_FIELD_PATTERN.search(remainder)
-            if not field_match:
-                continue
+            if field_match:
+                mac = normalize_mac_address(field_match.group("mac"))
+                if mac is None:
+                    continue
 
-            mac = normalize_mac_address(field_match.group("mac"))
-            if mac is None:
-                continue
+                field_name = field_match.group("field")
+                field_value = field_match.group("value").strip()
+                value_is_yes = field_value.strip().lower() == "yes"
 
-            field_name = field_match.group("field")
-            field_value = field_match.group("value").strip()
-            value_is_yes = field_value.strip().lower() == "yes"
+                event_type: str | None = None
+                confidence = "UNKNOWN"
 
-            event_type: str | None = None
-            confidence = "UNKNOWN"
+                if field_name in _CONNECTED_FIELD_NAMES:
+                    event_type = "connected" if value_is_yes else "disconnected"
+                    confidence = "HIGH"
+                elif field_name in _PAIRED_FIELD_NAMES and value_is_yes:
+                    event_type = "paired"
+                    confidence = "MEDIUM"
+                elif field_name in _TRUSTED_FIELD_NAMES and value_is_yes:
+                    event_type = "trusted"
+                    confidence = "MEDIUM"
+                elif field_name in _BLOCKED_FIELD_NAMES and value_is_yes:
+                    event_type = "blocked"
+                    confidence = "MEDIUM"
+                elif field_name == "RSSI":
+                    event_type = "advertised"
+                    confidence = "LOW"
 
-            if field_name in _CONNECTED_FIELD_NAMES:
-                event_type = "connected" if value_is_yes else "disconnected"
-                confidence = "HIGH"
-            elif field_name in _PAIRED_FIELD_NAMES and value_is_yes:
-                event_type = "paired"
-                confidence = "MEDIUM"
-            elif field_name in _TRUSTED_FIELD_NAMES and value_is_yes:
-                event_type = "trusted"
-                confidence = "MEDIUM"
-            elif field_name == "RSSI":
-                event_type = "advertised"
-                confidence = "LOW"
-
-            if event_type is None:
+                if event_type is not None:
+                    events.append(
+                        self._build_event(
+                            mac_address=mac,
+                            device_name=None,
+                            event_type=event_type,
+                            parsed_timestamp=parsed_dt,
+                            iso_timestamp=iso_ts,
+                            raw_timestamp=raw_timestamp,
+                            source_type=source_type,
+                            source_reference=source_reference,
+                            confidence=confidence,
+                            raw_reference=line.strip(),
+                        )
+                    )
                 # Fields such as bare Name/Alias/Class updates on their
                 # own are not treated as connection-history events; they
                 # carry no reliable evidence of a state transition.
+                continue
+
+            # Free-form daemon messages (connection failures, attempts,
+            # authentication failures) do not follow the structured
+            # "Device <MAC> <Field>: <value>" shape, so they are
+            # recognized by keyword instead. A MAC must be present in
+            # this same line for an event to be created at all; a
+            # failure/attempt message with no attributable MAC is
+            # intentionally left unclassified.
+            classification = self._classify_freeform_line(remainder)
+            if classification is None:
+                continue
+
+            event_type, confidence = classification
+            mac = self._extract_any_mac(remainder)
+            if mac is None:
                 continue
 
             events.append(
@@ -511,11 +735,13 @@ class ConnectionHistoryAnalyzer:
 
         Accepts device records as produced by
         :meth:`modules.linux_artifacts.LinuxArtifactsCollector.get_known_devices`
-        (or ``get_paired_devices`` / ``get_trusted_devices``). Only
-        explicit ``"paired": True`` or ``"trusted": True`` flags are
-        converted into events -- never a ``"connected"`` event, since
-        BlueZ's per-device ``info`` file does not record connection
-        history, only current pairing/trust/link-key state.
+        (or ``get_paired_devices`` / ``get_trusted_devices`` /
+        ``get_blocked_devices`` / ``get_bluez_device_evidence``). Only
+        explicit ``"paired": True``, ``"trusted": True``, or
+        ``"blocked": True`` flags are converted into events -- never a
+        ``"connected"`` event, since BlueZ's per-device ``info`` file
+        does not record connection history, only current pairing/trust/
+        blocked/link-key state.
 
         Args:
             known_devices: A list of device dictionaries as returned by
@@ -527,9 +753,10 @@ class ConnectionHistoryAnalyzer:
         Returns:
             A list of structured event dictionaries with ``timestamp``,
             ``date``, and ``time`` all ``None`` (BlueZ does not persist
-            when a device was paired/trusted), and ``confidence`` set to
-            ``"MEDIUM"``. Returns an empty list if ``known_devices`` is
-            empty or contains no valid records. Never raises.
+            when a device was paired/trusted/blocked), and ``confidence``
+            set to ``"MEDIUM"``. Returns an empty list if
+            ``known_devices`` is empty or contains no valid records.
+            Never raises.
         """
         if not known_devices:
             return []
@@ -584,6 +811,22 @@ class ConnectionHistoryAnalyzer:
                         mac_address=mac,
                         device_name=device_name,
                         event_type="trusted",
+                        parsed_timestamp=None,
+                        iso_timestamp=None,
+                        raw_timestamp=None,
+                        source_type=SOURCE_TYPE_BLUEZ_ARTIFACT,
+                        source_reference=source_reference,
+                        confidence="MEDIUM",
+                        raw_reference=raw_reference,
+                    )
+                )
+
+            if device.get("blocked") is True:
+                events.append(
+                    self._build_event(
+                        mac_address=mac,
+                        device_name=device_name,
+                        event_type="blocked",
                         parsed_timestamp=None,
                         iso_timestamp=None,
                         raw_timestamp=None,
@@ -737,8 +980,11 @@ class ConnectionHistoryAnalyzer:
         Groups events by (MAC, event type, timestamp) and, for groups
         spanning more than one distinct ``source_type``/``source_reference``
         pair, sets each member's ``"corroboration_count"`` to the number
-        of distinct sources involved. This surfaces corroboration to an
-        investigator without silently merging or discarding any record.
+        of distinct sources involved and lists those sources under
+        ``"corroborating_sources"``. This surfaces corroboration -- and
+        retains full source provenance for it -- without silently
+        merging or discarding any record, and without ever changing an
+        event's classification because multiple sources agree on it.
 
         Args:
             events: The list of structured events to annotate in place.
@@ -752,7 +998,12 @@ class ConnectionHistoryAnalyzer:
 
         for event in events:
             key = (event["mac_address"], event["event_type"], event["timestamp"] or "")
-            event["corroboration_count"] = len(groups.get(key, set()))
+            sources = groups.get(key, set())
+            event["corroboration_count"] = len(sources)
+            event["corroborating_sources"] = sorted(
+                f"{source_type}:{source_reference}"
+                for source_type, source_reference in sources
+            )
 
     def _deduplicate(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Remove exact-duplicate events while preserving corroboration.
@@ -966,6 +1217,40 @@ class ConnectionHistoryAnalyzer:
             "error": None,
         }
 
+    @staticmethod
+    def _backfill_device_names(events: list[dict[str, Any]]) -> None:
+        """Fill in missing device names from other evidence for the same MAC.
+
+        Some evidence carries a MAC address but no device name (e.g. a
+        bare ``Connected: yes`` journal line, or a connection-failure
+        message), while other evidence already collected for the same
+        MAC in the same evidence bundle does carry one (e.g. a
+        ``[NEW] Device <mac> <name>`` discovery line, or a BlueZ
+        artifact record with a cached ``Name``/``Alias``). This
+        cross-references only evidence already present in ``events`` --
+        never a network lookup, external database, or invented value --
+        so a name already established elsewhere in the same evidence
+        bundle is not needlessly reported as unavailable.
+
+        Args:
+            events: The combined list of structured events, annotated
+                in place. A device with no name anywhere in the supplied
+                evidence simply keeps ``device_name: None``.
+        """
+        name_by_mac: dict[str, str] = {}
+        for event in events:
+            name = event.get("device_name")
+            mac = event.get("mac_address")
+            if name and mac and mac not in name_by_mac:
+                name_by_mac[mac] = name
+
+        for event in events:
+            if not event.get("device_name"):
+                mac = event.get("mac_address")
+                resolved_name = name_by_mac.get(mac) if mac else None
+                if resolved_name:
+                    event["device_name"] = resolved_name
+
     # ----------------------------------------------------------------- #
     # Internal orchestration
     # ----------------------------------------------------------------- #
@@ -978,8 +1263,11 @@ class ConnectionHistoryAnalyzer:
 
         Returns:
             The combined, un-deduplicated, unordered list of structured
-            events from every supplied evidence source. Returns an empty
-            list if ``evidence`` is empty or ``None``.
+            events from every supplied evidence source, with missing
+            device names backfilled where another event for the same
+            MAC already established one (see
+            :meth:`_backfill_device_names`). Returns an empty list if
+            ``evidence`` is empty or ``None``.
         """
         if not evidence:
             return []
@@ -1009,6 +1297,7 @@ class ConnectionHistoryAnalyzer:
         if structured_events:
             events.extend(self.ingest_structured_events(structured_events))
 
+        self._backfill_device_names(events)
         return events
 
 
