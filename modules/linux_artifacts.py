@@ -6,13 +6,16 @@ Local Linux Bluetooth artifact collection module for
 **BlueTrace Forensic Suite**.
 
 This module contains the :class:`LinuxArtifactsCollector` class, whose
-sole responsibility is to collect Bluetooth-related forensic artifacts
-that already exist on the local Linux host: host/system information, the
-local Bluetooth controller's configuration, the paired/trusted/blocked/
-known device records persisted by the Linux Bluetooth stack (BlueZ)
-under ``/var/lib/bluetooth``, and locally available Bluetooth-related
-log evidence (via ``journalctl``) that may contain historical
-connection/disconnection events.
+sole responsibility is to acquire and PRESERVE Bluetooth-related
+forensic evidence that already exists on the local Linux host: host/
+system information, the local Bluetooth controller's configuration, the
+paired/trusted/blocked/known device records persisted by the Linux
+Bluetooth stack (BlueZ) under ``/var/lib/bluetooth`` (including each
+device's raw ``info`` file text, not just parsed fields), and locally
+available Bluetooth-related log evidence (via ``journalctl``, queried
+both by systemd unit and by syslog identifier) that may contain
+historical connection, disconnection, pairing, trust, authentication,
+and connection-failure evidence.
 
 This module never communicates with remote Bluetooth devices. It only
 reads local system state: environment metadata, local controller status
@@ -23,15 +26,19 @@ ever altered or deleted.
 
 Connection-history evidence
 ----------------------------
-This module is an **evidence acquisition layer only**. It collects and
-preserves raw local evidence -- it does not itself decide whether a
-device was historically connected, nor does it fabricate or infer
-connection events from static BlueZ state (a device being "paired" or
-"trusted" is not evidence of a connection). Historical connection
-reconstruction and interpretation is the responsibility of
-:class:`modules.connection_history.ConnectionHistoryAnalyzer`, which
+This module is an **evidence acquisition and preservation layer only**.
+It collects and preserves raw local evidence -- it does not itself
+decide whether a device was historically connected, nor does it
+fabricate or infer connection events from static BlueZ state (a device
+being "paired" or "trusted" is not evidence of a connection, and a
+journal line such as ``"failed connect to <MAC>"`` is evidence of a
+connection *attempt*, not a successful historical connection). Raw log
+text is always preserved alongside any structured metadata; this module
+never discards raw evidence after extracting fields from it, so that
+:class:`modules.connection_history.ConnectionHistoryAnalyzer` -- which
 consumes evidence bundles produced by
-:meth:`LinuxArtifactsCollector.build_connection_history_evidence`.
+:meth:`LinuxArtifactsCollector.build_connection_history_evidence` -- can
+independently interpret it.
 
 Forensic limitations
 ---------------------
@@ -39,13 +46,19 @@ Forensic limitations
   retention policy (``SystemMaxUse``/``SystemMaxFileSize``/journal
   rotation, or a wholly volatile in-memory journal); older Bluetooth
   events may simply no longer exist on disk.
-* The Bluetooth systemd unit name varies across distributions; this
-  module tries a small set of common candidate unit names and falls
-  back to a filtered, time-bounded journal search rather than dumping
-  the entire system journal.
-* Absence of journal evidence does not prove a device was never
-  connected -- only that no supporting log evidence was found on this
-  host within the collected window.
+* The Bluetooth systemd unit name varies across distributions, and
+  ``bluetoothd``'s own log lines are not always attributable to a
+  distinct systemd unit; this module queries by both unit name and
+  syslog identifier, and falls back to a filtered, time-bounded journal
+  search rather than dumping the entire system journal.
+* Absence of journal or BlueZ evidence does not prove a device was
+  never connected -- only that no supporting evidence was found on this
+  host within the collected window, or that the relevant evidence could
+  not be accessed (e.g. due to filesystem permissions, which is always
+  reported explicitly rather than silently treated as "no evidence").
+* BlueZ's per-device ``info`` file records current pairing/trust/
+  blocked/link-key state; it does NOT record connection history, live
+  RSSI, or a "Connected" flag, so none of those are fabricated from it.
 
 BlueTrace Forensic Suite is a defensive, forensic-oriented tool intended
 for lawful digital forensics and incident-response use cases involving
@@ -101,6 +114,16 @@ _NO_DATA: Final[str] = "no_data"
 #: distributions, so several common names are attempted before falling
 #: back to a filtered, time-bounded journal search.
 _JOURNALCTL_UNIT_CANDIDATES: Final[tuple[str, ...]] = ("bluetooth", "bluetoothd")
+
+#: Candidate syslog identifiers queried directly via ``journalctl -t``
+#: (``SYSLOG_IDENTIFIER``), independent of which systemd unit launched
+#: the process. Real-world Linux systems commonly tag ``bluetoothd``'s
+#: own log lines (e.g. ``"bluetoothd: src/profile.c:ext_connect() ..."``)
+#: with this identifier even when captured under a differently-named
+#: unit, so this targeted, read-only query is attempted in addition to
+#: the unit-based queries above rather than only as a last-resort
+#: fallback.
+_JOURNALCTL_IDENTIFIER_CANDIDATES: Final[tuple[str, ...]] = ("bluetoothd",)
 
 #: Default lookback window passed to ``journalctl --since`` when the
 #: caller does not specify one. Chosen to be a reasonable, targeted
@@ -260,10 +283,62 @@ class LinuxArtifactsCollector:
             devices.append({"mac": mac, "name": name or _UNKNOWN_VALUE})
         return devices
 
+    @staticmethod
+    def _empty_device_record(
+        controller_mac: str, device_mac: str, info_path: Path, error: str | None
+    ) -> dict[str, Any]:
+        """Build a placeholder device record for evidence that could not be read.
+
+        Used both when a device directory has no ``info`` file at all
+        and when an ``info`` file exists but could not be read/parsed.
+        The device's presence in the BlueZ state directory (its MAC
+        address, controller, and path) is itself evidence and is
+        preserved even when the file content is unavailable, per the
+        forensic requirement that inaccessible evidence must be reported
+        explicitly rather than silently treated as "no devices".
+
+        Args:
+            controller_mac: The MAC address of the owning controller.
+            device_mac: The MAC address of the device.
+            info_path: The path where the device's ``info`` file would
+                be located, whether or not it actually exists.
+            error: A short error code explaining why no data is
+                available (e.g. ``"info_file_missing"``,
+                :data:`_PERMISSION_DENIED`), or ``None``.
+
+        Returns:
+            A device dictionary with the standard schema (see
+            :meth:`_read_device_info_file`), all data fields at their
+            "unavailable" defaults, and ``"info_available"`` set to
+            ``False``.
+        """
+        return {
+            "mac": device_mac,
+            "controller_mac": controller_mac,
+            "info_path": str(info_path),
+            "info_available": False,
+            "error": error,
+            "name": _UNKNOWN_VALUE,
+            "alias": None,
+            "class": _UNKNOWN_VALUE,
+            "address_type": None,
+            "trusted": False,
+            "blocked": False,
+            "paired": False,
+            "uuids": [],
+            "raw_info": None,
+        }
+
     def _read_device_info_file(
         self, info_path: Path, controller_mac: str, device_mac: str
-    ) -> dict[str, Any] | None:
-        """Parse a single BlueZ per-device ``info`` file.
+    ) -> dict[str, Any]:
+        """Parse a single BlueZ per-device ``info`` file, preserving its raw text.
+
+        BlueZ's ``info`` file records *current* pairing/trust/blocked/
+        link-key state, an optionally cached name/alias, device class,
+        address type, and advertised service UUIDs. It does NOT record
+        connection history or a live "Connected" flag, so neither is
+        read from it or fabricated here.
 
         Args:
             info_path: Path to the device's ``info`` file.
@@ -272,18 +347,39 @@ class LinuxArtifactsCollector:
             device_mac: The MAC address of the device (the directory name).
 
         Returns:
-            A dictionary describing the device, or ``None`` if the file
-            could not be read.
+            A dictionary with keys ``"mac"``, ``"controller_mac"``,
+            ``"info_path"``, ``"info_available"`` (bool),
+            ``"error"`` (str or ``None``), ``"name"``, ``"alias"``,
+            ``"class"``, ``"address_type"``, ``"trusted"``, ``"blocked"``,
+            ``"paired"``, ``"uuids"`` (list[str]), and ``"raw_info"``
+            (the file's exact raw text, or ``None`` if it could not be
+            read). Never raises; permission and I/O errors, and files
+            that could be read but contain no recognizable BlueZ
+            sections, are all reported via ``"error"`` rather than
+            silently producing an empty-looking but "successful" record.
         """
+        record = self._empty_device_record(controller_mac, device_mac, info_path, None)
+
         try:
             content = info_path.read_text(encoding="utf-8")
+        except PermissionError:
+            record["error"] = _PERMISSION_DENIED
+            self._logger.warning(
+                "Permission denied while reading %s.", info_path
+            )
+            return record
         except OSError as exc:
+            record["error"] = f"read_failed: {exc}"
             self._logger.warning("Could not read %s: %s", info_path, exc)
-            return None
+            return record
+
+        record["raw_info"] = content
+        record["info_available"] = True
 
         current_section = ""
         fields: dict[str, str] = {}
         sections: set[str] = set()
+        uuids: list[str] = []
 
         for line in content.splitlines():
             stripped_line = line.strip()
@@ -293,7 +389,23 @@ class LinuxArtifactsCollector:
                 continue
             if current_section == "General" and "=" in stripped_line:
                 key, _, value = stripped_line.partition("=")
-                fields[key.strip()] = value.strip()
+                key = key.strip()
+                value = value.strip()
+                if key == "UUID":
+                    # BlueZ info files may list multiple UUID= lines
+                    # within [General]; a plain dict would silently
+                    # drop all but the last one.
+                    uuids.append(value)
+                else:
+                    fields[key] = value
+
+        if not fields and not uuids and not sections:
+            record["error"] = "malformed_info_file"
+            self._logger.warning(
+                "Info file %s contained no recognizable BlueZ sections.",
+                info_path,
+            )
+            return record
 
         name = fields.get("Name") or fields.get("Alias") or _UNKNOWN_VALUE
         trusted = fields.get("Trusted", "").lower() == "true"
@@ -304,44 +416,64 @@ class LinuxArtifactsCollector:
         else:
             paired = "LinkKey" in sections or "LongTermKey" in sections
 
-        return {
-            "mac": device_mac,
-            "controller_mac": controller_mac,
-            "name": name,
-            "class": fields.get("Class", _UNKNOWN_VALUE),
-            "trusted": trusted,
-            "blocked": blocked,
-            "paired": paired,
-        }
+        record.update(
+            {
+                "name": name,
+                "alias": fields.get("Alias"),
+                "class": fields.get("Class", _UNKNOWN_VALUE),
+                "address_type": fields.get("AddressType"),
+                "trusted": trusted,
+                "blocked": blocked,
+                "paired": paired,
+                "uuids": uuids,
+            }
+        )
+        return record
 
-    def _read_known_devices_from_disk(self) -> list[dict[str, Any]]:
-        """Read all cached device records from the BlueZ state directory.
+    def _walk_bluez_state(
+        self,
+    ) -> tuple[list[dict[str, Any]], str | None, list[dict[str, str]]]:
+        """Walk the BlueZ state directory and read every device's info file.
 
-        Walks ``/var/lib/bluetooth/<controller_mac>/<device_mac>/info``
-        for every controller and device directory present, parsing each
-        into a structured record.
+        A single, shared traversal used by both :meth:`get_known_devices`
+        (backward-compatible list output) and :meth:`get_bluez_device_evidence`
+        (full acquisition-status output), so directory-walking logic is
+        never duplicated.
+
+        Per-controller or per-device access problems (e.g. a single
+        unreadable device directory) are recorded individually in
+        ``collection_errors`` rather than aborting the whole walk, so
+        that one inaccessible item never hides evidence about the
+        others. Only a failure to list the top-level state directory
+        itself is treated as a fatal ``top_level_error``.
 
         Returns:
-            A list of device dictionaries as produced by
-            :meth:`_read_device_info_file`. Returns an empty list if the
-            state directory is missing or cannot be read.
+            A tuple of ``(devices, top_level_error, collection_errors)``.
+            ``top_level_error`` is one of ``"directory_missing"``,
+            :data:`_PERMISSION_DENIED`, or a ``"read_failed: ..."``
+            message when the state directory could not be listed at
+            all; otherwise ``None``. ``collection_errors`` is a list of
+            ``{"path": ..., "error": ...}`` dictionaries for any
+            individual controller/device directory or info file that
+            could not be fully read.
         """
         devices: list[dict[str, Any]] = []
+        collection_errors: list[dict[str, str]] = []
 
         try:
             if not _BLUETOOTH_STATE_DIR.is_dir():
-                return devices
+                return devices, "directory_missing", collection_errors
             controller_dirs = list(_BLUETOOTH_STATE_DIR.iterdir())
         except PermissionError:
             self._logger.error(
                 "Permission denied while accessing %s.", _BLUETOOTH_STATE_DIR
             )
-            return devices
+            return devices, _PERMISSION_DENIED, collection_errors
         except OSError as exc:
             self._logger.warning(
                 "Could not list %s: %s", _BLUETOOTH_STATE_DIR, exc
             )
-            return devices
+            return devices, f"read_failed: {exc}", collection_errors
 
         for controller_dir in controller_dirs:
             if not controller_dir.is_dir():
@@ -354,26 +486,61 @@ class LinuxArtifactsCollector:
                 self._logger.warning(
                     "Permission denied while accessing %s.", controller_dir
                 )
+                collection_errors.append(
+                    {"path": str(controller_dir), "error": _PERMISSION_DENIED}
+                )
                 continue
             except OSError as exc:
                 self._logger.warning(
                     "Could not list %s: %s", controller_dir, exc
+                )
+                collection_errors.append(
+                    {"path": str(controller_dir), "error": f"read_failed: {exc}"}
                 )
                 continue
 
             for device_dir in device_dirs:
                 if not device_dir.is_dir():
                     continue
+                device_mac = device_dir.name
                 info_path = device_dir / _DEVICE_INFO_FILENAME
+
                 if not info_path.is_file():
+                    devices.append(
+                        self._empty_device_record(
+                            controller_mac, device_mac, info_path, "info_file_missing"
+                        )
+                    )
                     continue
 
                 record = self._read_device_info_file(
-                    info_path, controller_mac, device_dir.name
+                    info_path, controller_mac, device_mac
                 )
-                if record is not None:
-                    devices.append(record)
+                devices.append(record)
+                if record.get("error"):
+                    collection_errors.append(
+                        {"path": str(info_path), "error": record["error"]}
+                    )
 
+        return devices, None, collection_errors
+
+    def _read_known_devices_from_disk(self) -> list[dict[str, Any]]:
+        """Read all cached device records from the BlueZ state directory.
+
+        Preserved for backward compatibility: returns exactly the device
+        list, discarding the richer top-level/collection error status
+        that :meth:`get_bluez_device_evidence` exposes. Prefer
+        :meth:`get_bluez_device_evidence` when the caller needs to know
+        *why* evidence might be incomplete (e.g. permission denied)
+        rather than just receiving an empty list.
+
+        Returns:
+            A list of device dictionaries as produced by
+            :meth:`_read_device_info_file` / :meth:`_empty_device_record`.
+            Returns an empty list if the state directory is missing or
+            cannot be read at all.
+        """
+        devices, _top_level_error, _collection_errors = self._walk_bluez_state()
         return devices
 
     # ----------------------------------------------------------------- #
@@ -561,8 +728,54 @@ class LinuxArtifactsCollector:
             A list of every device record found under the BlueZ state
             directory, regardless of paired/trusted status. Returns an
             empty list if the state directory is missing or inaccessible.
+            Preserved for backward compatibility; prefer
+            :meth:`get_bluez_device_evidence` when the caller needs to
+            distinguish "no devices present" from "evidence could not be
+            acquired" (e.g. permission denied).
         """
         return self._read_known_devices_from_disk()
+
+    def get_bluez_device_evidence(self) -> dict[str, Any]:
+        """Collect BlueZ persisted device state with full acquisition status.
+
+        Unlike :meth:`get_known_devices` (which, for backward
+        compatibility, returns a bare list and cannot distinguish "the
+        directory genuinely contained no devices" from "evidence could
+        not be acquired"), this method reports explicit acquisition
+        status so that inaccessible evidence is never silently presented
+        as an empty result.
+
+        Returns:
+            A dictionary with keys:
+
+            * ``"path"``: the BlueZ state directory path.
+            * ``"accessible"`` (bool): whether the top-level state
+              directory itself could be listed at all.
+            * ``"devices"`` (list[dict]): every device record found,
+              including placeholder records (with
+              ``"info_available": False`` and an ``"error"`` code) for
+              devices whose ``info`` file was missing or unreadable.
+            * ``"collection_errors"`` (list[dict]): ``{"path": ...,
+              "error": ...}`` entries for every individual controller
+              directory, device directory, or info file that could not
+              be fully read (e.g. :data:`_PERMISSION_DENIED`), even when
+              other devices were read successfully.
+            * ``"error"`` (str or ``None``): set only when the top-level
+              state directory itself could not be listed (e.g.
+              ``"directory_missing"`` or :data:`_PERMISSION_DENIED`);
+              ``None`` when at least directory listing succeeded, even
+              if individual devices had their own errors.
+
+            Never raises.
+        """
+        devices, top_level_error, collection_errors = self._walk_bluez_state()
+        return {
+            "path": str(_BLUETOOTH_STATE_DIR),
+            "accessible": top_level_error is None,
+            "devices": devices,
+            "collection_errors": collection_errors,
+            "error": top_level_error,
+        }
 
     # ----------------------------------------------------------------- #
     # Bluetooth connection log evidence (journalctl)
@@ -599,6 +812,14 @@ class LinuxArtifactsCollector:
             A dictionary with keys ``"source_type"``, ``"source_reference"``,
             ``"collected_at"`` (UTC ISO-8601), ``"content"``, ``"success"``,
             ``"error"``, and ``"line_count"``.
+
+        Note:
+            ``"collected_at"`` records when THIS ACQUISITION ran; it is
+            metadata about the collection process, never a substitute
+            for the actual event timestamps embedded within ``content``
+            itself. Extracting and normalizing those source timestamps
+            is the responsibility of
+            :class:`modules.connection_history.ConnectionHistoryAnalyzer`.
         """
         return {
             "source_type": source_type,
@@ -630,40 +851,121 @@ class LinuxArtifactsCollector:
         """
         return self._run_command(command_args, timeout=timeout)
 
+    def _run_journalctl_query(
+        self,
+        command_name: str,
+        command_args: list[str],
+        timeout: int,
+        evidence_sources: list[dict[str, Any]],
+    ) -> bool:
+        """Run one journalctl query and append its evidence record.
+
+        Shared by the unit-based, identifier-based, and fallback
+        grep-based queries in :meth:`get_bluetooth_log_evidence` so each
+        query's success/failure handling and evidence-record shape stay
+        identical and are not duplicated three times.
+
+        Args:
+            command_name: The resolved ``journalctl`` command name
+                (included here only for logging context).
+            command_args: The full command and arguments to execute.
+            timeout: Maximum time, in seconds, to wait for the command.
+            evidence_sources: The list to append this query's evidence
+                record to, in place.
+
+        Returns:
+            ``True`` if this query produced usable evidence (i.e. was
+            appended with ``"success": True``), ``False`` otherwise.
+        """
+        source_reference = " ".join(command_args)
+        output, error = self._collect_journalctl_output(command_args, timeout=timeout)
+
+        if error:
+            self._logger.warning(
+                "journalctl query failed (%s): %s", source_reference, error
+            )
+            evidence_sources.append(
+                self._build_log_evidence_record(
+                    source_type=_SOURCE_TYPE_JOURNALCTL,
+                    source_reference=source_reference,
+                    content=None,
+                    success=False,
+                    error=error,
+                )
+            )
+            return False
+
+        if not output.strip():
+            evidence_sources.append(
+                self._build_log_evidence_record(
+                    source_type=_SOURCE_TYPE_JOURNALCTL,
+                    source_reference=source_reference,
+                    content=None,
+                    success=False,
+                    error=_NO_DATA,
+                )
+            )
+            return False
+
+        evidence_sources.append(
+            self._build_log_evidence_record(
+                source_type=_SOURCE_TYPE_JOURNALCTL,
+                source_reference=source_reference,
+                content=output,
+                success=True,
+                error=None,
+            )
+        )
+        return True
+
     def get_bluetooth_log_evidence(
         self,
         since: str = _DEFAULT_JOURNAL_LOOKBACK,
         unit_candidates: tuple[str, ...] = _JOURNALCTL_UNIT_CANDIDATES,
+        identifier_candidates: tuple[str, ...] = _JOURNALCTL_IDENTIFIER_CANDIDATES,
     ) -> list[dict[str, Any]]:
         """Collect locally available Bluetooth-related journal log evidence.
 
         Attempts a targeted, read-only ``journalctl`` query for each
         candidate Bluetooth systemd unit name in ``unit_candidates``
         (since unit naming for ``bluetoothd`` varies across
-        distributions). If none of those unit-scoped queries yield any
-        data, falls back to a single time-bounded, pattern-filtered
-        journal search (``journalctl -g``) instead of retrieving the
-        entire system journal, keeping collection targeted per the
-        framework's evidence-handling policy.
+        distributions), AND a separate query for each syslog identifier
+        in ``identifier_candidates`` via ``journalctl -t`` (since
+        ``bluetoothd``'s own log lines are commonly tagged with that
+        identifier regardless of which unit launched it). Every query is
+        preserved as its own separate evidence record -- sources are
+        never merged, overwritten, or deduplicated here, so a later
+        analyzer can independently correlate them. Only if NONE of those
+        targeted queries yield any data does this method fall back to a
+        single time-bounded, pattern-filtered journal search
+        (``journalctl -g``), instead of retrieving the entire system
+        journal, keeping collection targeted per the framework's
+        evidence-handling policy.
 
         This method never classifies or interprets the collected text --
-        it only acquires and preserves it. Classification into
-        connected/disconnected/paired/etc. events is performed later by
+        it only acquires and preserves it verbatim. Classification into
+        connected/disconnected/paired/authentication-failure/etc. events
+        is performed later by
         :class:`modules.connection_history.ConnectionHistoryAnalyzer`.
 
         Args:
             since: A ``journalctl --since``-compatible time expression
                 bounding how far back to search (e.g. ``"7 days ago"``,
                 ``"2026-08-01"``). Defaults to
-                :data:`_DEFAULT_JOURNAL_LOOKBACK`.
+                :data:`_DEFAULT_JOURNAL_LOOKBACK`; this default lookback
+                window is unchanged from the project's existing targeted
+                collection behavior.
             unit_candidates: Systemd unit names to try, in order.
                 Defaults to :data:`_JOURNALCTL_UNIT_CANDIDATES`.
+            identifier_candidates: Syslog identifiers to try via
+                ``journalctl -t``, in order. Defaults to
+                :data:`_JOURNALCTL_IDENTIFIER_CANDIDATES`.
 
         Returns:
             A list of log evidence records (see
             :meth:`_build_log_evidence_record`), one per collection
-            attempt actually made. Includes both successful and failed
-            attempts so that the absence of evidence is itself
+            attempt actually made -- both successful and failed, so that
+            the absence of evidence from a given source is itself
             documented rather than silently omitted. Returns a single
             failed record if ``journalctl`` is not available on this
             system. Never raises.
@@ -684,7 +986,8 @@ class LinuxArtifactsCollector:
             )
             return evidence_sources
 
-        found_unit_evidence = False
+        found_targeted_evidence = False
+
         for unit_name in unit_candidates:
             command_args = [
                 command_name,
@@ -693,48 +996,25 @@ class LinuxArtifactsCollector:
                 "-o", _JOURNALCTL_OUTPUT_FORMAT,
                 "--since", since,
             ]
-            source_reference = " ".join(command_args)
-            output, error = self._collect_journalctl_output(command_args, timeout=15)
+            if self._run_journalctl_query(
+                command_name, command_args, 15, evidence_sources
+            ):
+                found_targeted_evidence = True
 
-            if error:
-                self._logger.warning(
-                    "journalctl collection failed for unit %s: %s", unit_name, error
-                )
-                evidence_sources.append(
-                    self._build_log_evidence_record(
-                        source_type=_SOURCE_TYPE_JOURNALCTL,
-                        source_reference=source_reference,
-                        content=None,
-                        success=False,
-                        error=error,
-                    )
-                )
-                continue
+        for identifier in identifier_candidates:
+            command_args = [
+                command_name,
+                "-t", identifier,
+                "--no-pager",
+                "-o", _JOURNALCTL_OUTPUT_FORMAT,
+                "--since", since,
+            ]
+            if self._run_journalctl_query(
+                command_name, command_args, 15, evidence_sources
+            ):
+                found_targeted_evidence = True
 
-            if not output.strip():
-                evidence_sources.append(
-                    self._build_log_evidence_record(
-                        source_type=_SOURCE_TYPE_JOURNALCTL,
-                        source_reference=source_reference,
-                        content=None,
-                        success=False,
-                        error=_NO_DATA,
-                    )
-                )
-                continue
-
-            evidence_sources.append(
-                self._build_log_evidence_record(
-                    source_type=_SOURCE_TYPE_JOURNALCTL,
-                    source_reference=source_reference,
-                    content=output,
-                    success=True,
-                    error=None,
-                )
-            )
-            found_unit_evidence = True
-
-        if not found_unit_evidence:
+        if not found_targeted_evidence:
             command_args = [
                 command_name,
                 "--no-pager",
@@ -742,42 +1022,7 @@ class LinuxArtifactsCollector:
                 "--since", since,
                 "-g", _BLUETOOTH_GREP_PATTERN,
             ]
-            source_reference = " ".join(command_args)
-            output, error = self._collect_journalctl_output(command_args, timeout=20)
-
-            if error:
-                self._logger.warning(
-                    "journalctl fallback grep collection failed: %s", error
-                )
-                evidence_sources.append(
-                    self._build_log_evidence_record(
-                        source_type=_SOURCE_TYPE_JOURNALCTL,
-                        source_reference=source_reference,
-                        content=None,
-                        success=False,
-                        error=error,
-                    )
-                )
-            elif not output.strip():
-                evidence_sources.append(
-                    self._build_log_evidence_record(
-                        source_type=_SOURCE_TYPE_JOURNALCTL,
-                        source_reference=source_reference,
-                        content=None,
-                        success=False,
-                        error=_NO_DATA,
-                    )
-                )
-            else:
-                evidence_sources.append(
-                    self._build_log_evidence_record(
-                        source_type=_SOURCE_TYPE_JOURNALCTL,
-                        source_reference=source_reference,
-                        content=output,
-                        success=True,
-                        error=None,
-                    )
-                )
+            self._run_journalctl_query(command_name, command_args, 20, evidence_sources)
 
         return evidence_sources
 
@@ -871,16 +1116,21 @@ class LinuxArtifactsCollector:
             ``"bluetooth_controller"``, ``"adapter_information"``,
             ``"bluetooth_directory"``, ``"known_devices"``,
             ``"paired_devices"``, ``"trusted_devices"``,
-            ``"blocked_devices"``, ``"connection_log_evidence"`` (raw
-            journal evidence records, see
-            :meth:`get_bluetooth_log_evidence`), and
-            ``"connection_history_evidence"`` (the same evidence,
-            pre-packaged via :meth:`build_connection_history_evidence`
-            for direct use with
-            :class:`modules.connection_history.ConnectionHistoryAnalyzer`).
+            ``"blocked_devices"`` (all four preserved exactly as before
+            for backward compatibility), ``"bluez_device_evidence"``
+            (the same device data plus explicit acquisition status --
+            see :meth:`get_bluez_device_evidence` -- so permission
+            issues or unreadable devices are never silently presented as
+            "no devices"), ``"connection_log_evidence"`` (raw journal
+            evidence records, see :meth:`get_bluetooth_log_evidence`),
+            and ``"connection_history_evidence"`` (the same log/BlueZ
+            evidence, pre-packaged via
+            :meth:`build_connection_history_evidence` for direct use
+            with :class:`modules.connection_history.ConnectionHistoryAnalyzer`).
         """
         try:
-            known_devices = self.get_known_devices()
+            bluez_device_evidence = self.get_bluez_device_evidence()
+            known_devices = bluez_device_evidence["devices"]
             connection_log_evidence = self.get_bluetooth_log_evidence()
             return {
                 "host_information": self.get_host_information(),
@@ -897,6 +1147,7 @@ class LinuxArtifactsCollector:
                 "blocked_devices": [
                     device for device in known_devices if device.get("blocked")
                 ],
+                "bluez_device_evidence": bluez_device_evidence,
                 "connection_log_evidence": connection_log_evidence,
                 "connection_history_evidence": self.build_connection_history_evidence(
                     known_devices=known_devices,
@@ -914,6 +1165,13 @@ class LinuxArtifactsCollector:
                 "paired_devices": [],
                 "trusted_devices": [],
                 "blocked_devices": [],
+                "bluez_device_evidence": {
+                    "path": str(_BLUETOOTH_STATE_DIR),
+                    "accessible": False,
+                    "devices": [],
+                    "collection_errors": [],
+                    "error": str(exc),
+                },
                 "connection_log_evidence": [],
                 "connection_history_evidence": {
                     "log_sources": [],
