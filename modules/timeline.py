@@ -74,13 +74,20 @@ _UNKNOWN_VALUE: Final[str] = "Unknown"
 
 #: The set of event types this module recognizes on input. Kept
 #: identical to :data:`modules.connection_history.EVENT_TYPES` so that
-#: timeline construction never silently invents a new taxonomy.
+#: timeline construction never silently invents a new taxonomy -- and,
+#: just as importantly, never silently *collapses* a distinct upstream
+#: event type (e.g. ``connection_failed``) down into ``"unknown"``
+#: merely because this set failed to keep up with that taxonomy.
 EVENT_TYPES: Final[frozenset[str]] = frozenset(
     {
         "connected",
         "disconnected",
+        "connection_attempt",
+        "connection_failed",
+        "authentication_failure",
         "paired",
         "trusted",
+        "blocked",
         "discovered",
         "advertised",
         "unknown",
@@ -637,22 +644,29 @@ class ForensicTimeline:
         Returns:
             A dictionary with keys: ``"total_events"``,
             ``"connected_events"``, ``"disconnected_events"``,
+            ``"connection_attempt_events"``,
+            ``"connection_failed_events"``,
+            ``"authentication_failure_events"``,
             ``"paired_events"``, ``"trusted_events"``,
-            ``"discovered_events"``, ``"advertised_events"``,
-            ``"unknown_events"``, ``"devices_involved"``,
-            ``"events_without_timestamp"``, ``"first_timestamp"``
-            (oldest known timestamp, or ``None``), and
-            ``"last_timestamp"`` (newest known timestamp, or
-            ``None``). Returns an all-zero/empty summary if
-            ``timeline`` is empty or not a list.
+            ``"blocked_events"``, ``"discovered_events"``,
+            ``"advertised_events"``, ``"unknown_events"``,
+            ``"devices_involved"``, ``"events_without_timestamp"``,
+            ``"first_timestamp"`` (oldest known timestamp, or
+            ``None``), and ``"last_timestamp"`` (newest known
+            timestamp, or ``None``). Returns an all-zero/empty summary
+            if ``timeline`` is empty or not a list.
         """
         if not isinstance(timeline, list) or not timeline:
             return {
                 "total_events": 0,
                 "connected_events": 0,
                 "disconnected_events": 0,
+                "connection_attempt_events": 0,
+                "connection_failed_events": 0,
+                "authentication_failure_events": 0,
                 "paired_events": 0,
                 "trusted_events": 0,
+                "blocked_events": 0,
                 "discovered_events": 0,
                 "advertised_events": 0,
                 "unknown_events": 0,
@@ -688,8 +702,12 @@ class ForensicTimeline:
             "total_events": len(timeline),
             "connected_events": counts["connected"],
             "disconnected_events": counts["disconnected"],
+            "connection_attempt_events": counts["connection_attempt"],
+            "connection_failed_events": counts["connection_failed"],
+            "authentication_failure_events": counts["authentication_failure"],
             "paired_events": counts["paired"],
             "trusted_events": counts["trusted"],
+            "blocked_events": counts["blocked"],
             "discovered_events": counts["discovered"],
             "advertised_events": counts["advertised"],
             "unknown_events": counts["unknown"],
