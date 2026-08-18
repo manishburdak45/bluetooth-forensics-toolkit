@@ -106,7 +106,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Final
 
 from config import LOG_LEVEL
@@ -1028,6 +1028,49 @@ class ConnectionHistoryAnalyzer:
         self._annotate_corroboration(deduplicated)
         return deduplicated
 
+    #: Reference point used to convert a timestamp into a plain elapsed-
+    #: seconds value for sorting (see :meth:`_sort_events_descending`).
+    #: Any fixed reference works equally well here; this one is simply
+    #: guaranteed to precede every representable event timestamp.
+    _SORT_EPOCH: Final[datetime] = datetime(1, 1, 1)
+
+    @classmethod
+    def _sort_seconds(cls, dt: datetime) -> float:
+        """Convert an event timestamp into a host-timezone-independent value.
+
+        ``datetime.timestamp()`` resolves a timezone-*naive* datetime
+        using the local timezone of the machine executing the analysis,
+        not the machine the evidence was collected from. Two identical
+        evidence bundles analyzed on hosts configured with different
+        local timezones could previously sort naive-timestamp events
+        (e.g. year-less syslog-style lines combined with
+        ``assume_year``) differently relative to timezone-*aware*
+        events (e.g. ``journalctl -o short-iso`` output, which always
+        carries an explicit offset) -- a non-deterministic ordering bug
+        for a forensic tool, where the same evidence must always
+        reconstruct the same timeline regardless of the analyst's own
+        machine configuration.
+
+        This helper removes that host dependency: a timezone-aware
+        datetime is first normalized to UTC (using its own explicit,
+        evidence-derived offset -- never a fabricated one), and a
+        timezone-naive datetime's wall-clock value is used exactly as
+        parsed, with no implicit reinterpretation in the host's local
+        timezone. Both cases are then measured as elapsed seconds from
+        a fixed, arbitrary reference point, giving a stable sort value
+        that depends only on the evidence itself.
+
+        Args:
+            dt: A parsed event timestamp (naive or timezone-aware).
+
+        Returns:
+            Elapsed seconds from a fixed reference point, suitable for
+            relative ordering only (not a real Unix timestamp).
+        """
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return (dt - ConnectionHistoryAnalyzer._SORT_EPOCH).total_seconds()
+
     @staticmethod
     def _sort_events_descending(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Order events newest-first, deterministically.
@@ -1053,7 +1096,7 @@ class ConnectionHistoryAnalyzer:
             dt = event.get("_sort_datetime")
             if dt is None:
                 return (1, 0.0, index)
-            return (0, -dt.timestamp(), index)
+            return (0, -ConnectionHistoryAnalyzer._sort_seconds(dt), index)
 
         indexed.sort(key=sort_key)
 
